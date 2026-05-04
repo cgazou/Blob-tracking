@@ -1,0 +1,1 @@
+python blob_tracker_app.py --threshold 10 --min-area 80 --max-area 10000 --max-blobs 4  --input station2world.mp4

@@ -1,0 +1,1 @@
+python blob_tracker_app.py --threshold 150 --min-area 10000 --max-area 50000 --max-blobs 100 --input road.mp4 --output output/abc.mp4
