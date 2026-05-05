@@ -2,574 +2,352 @@ import numpy as np
 import cv2
 import argparse
 import random
+import os
 from collections import deque
+
+# ── Paramètres trails ───────────────────────────────────────────────────────
+TRAIL_MAX_LEN    = 40
+TRAIL_MATCH_DIST = 150
 
 class BlobTracker:
     def __init__(self):
-        self.detector = None
-        self.last_params = None
-        
-        self.frame_skip_cache = {
-            'counter': 0,
-            'last_keypoints': [],
-            'last_centers': [],
-            'last_sizes': [],
-            'velocities': [],
-            'smoothed_centers': [],
-            'smoothed_velocities': [],
-            'smoothed_sizes': []
-        }
-        
-        self.trail_cache = {'interpolated': None, 'cache_key': None}
-        
-        self.basis_matrix = 0.5 * np.array([
-            [0, 2, 0, 0],
-            [-1, 0, 1, 0],
-            [2, -5, 4, -1],
-            [-1, 3, -3, 1]
-        ], dtype=np.float32)
-
-        self.names_list = [
-                'real',
-                'double',
-                'station',
-                'world', 
-                'dream',
-                'bizoocross',
-                'helmut',
-                'only',
-                'path',
-                '2world'
-            ]
+        self.tracks     = {}
+        self.next_id    = 0
         self.blob_names = {}
+        self.names_list = ['real','double','station','world','dream',
+                           'bizoocross','helmut','only','path','2world']
 
-    
-    def get_basis_matrix(self, resolution):
+    def _catmull_rom(self, pts, resolution=8):
+        if len(pts) < 4:
+            return pts
+        basis = 0.5 * np.array([
+            [0, 2, 0, 0], [-1, 0, 1, 0],
+            [2, -5, 4, -1], [-1, 3, -3, 1]
+        ], dtype=np.float32)
         t = np.linspace(0, 1, resolution, dtype=np.float32)
-        t2 = t * t
-        t3 = t2 * t
-        return np.column_stack([
-            np.ones(resolution, dtype=np.float32),
-            t, t2, t3
-        ]) @ self.basis_matrix
-    
-    def interpolate_catmull_rom_cached(self, centers, resolution=8):
-        if len(centers) < 4:
-            return centers
-        cache_key = (tuple(map(tuple, centers)), resolution)
-        if self.trail_cache.get('cache_key') == cache_key:
-            return self.trail_cache['interpolated']
-        points_array = np.array(centers, dtype=np.float32)
-        basis_matrix = self.get_basis_matrix(resolution)
+        T = np.column_stack([np.ones(resolution), t, t*t, t*t*t]) @ basis
+        points = np.array(pts, dtype=np.float32)
         result = []
-        for i in range(1, len(centers) - 2):
-            control_points = points_array[i-1:i+3]
-            segment = basis_matrix @ control_points
-            result.extend(segment.tolist())
-        self.trail_cache['interpolated'] = result
-        self.trail_cache['cache_key'] = cache_key
+        for i in range(1, len(pts) - 2):
+            result.extend((T @ points[i-1:i+3]).tolist())
         return result
-    
-    def smooth_interpolate_positions(self, last_centers, last_sizes, smoothed_velocities,
-                                     frame_fraction, smoothing_factor):
-        if not last_centers or not smoothed_velocities:
-            return last_centers, last_sizes
-        if frame_fraction < 0.5:
-            t = frame_fraction * 2
-            eased_fraction = t * t * t / 2
-        else:
-            t = (frame_fraction - 0.5) * 2
-            eased_fraction = 0.5 + (1 - (1 - t) * (1 - t) * (1 - t)) / 2
-        final_fraction = eased_fraction * smoothing_factor + frame_fraction * (1 - smoothing_factor)
-        interpolated_centers = []
-        interpolated_sizes = []
-        for i, (center, size) in enumerate(zip(last_centers, last_sizes)):
-            if i < len(smoothed_velocities):
-                vel = smoothed_velocities[i]
-                new_x = int(center[0] + vel[0] * final_fraction)
-                new_y = int(center[1] + vel[1] * final_fraction)
-                interpolated_centers.append((new_x, new_y))
-                interpolated_sizes.append(size)
+
+    def _match_and_update(self, detections):
+        unmatched = set(self.tracks.keys())
+        assigned  = []
+        for cx, cy, w, h in detections:
+            best_id, best_dist = None, float('inf')
+            for tid in unmatched:
+                tx, ty = self.tracks[tid]['center']
+                dist = np.sqrt((cx-tx)**2 + (cy-ty)**2)
+                if dist < best_dist and dist < TRAIL_MATCH_DIST:
+                    best_dist, best_id = dist, tid
+            if best_id is not None:
+                unmatched.discard(best_id)
+                self.tracks[best_id].update({'center': (cx,cy), 'w': w, 'h': h})
+                self.tracks[best_id]['history'].append((cx, cy))
+                assigned.append(best_id)
             else:
-                interpolated_centers.append(center)
-                interpolated_sizes.append(size)
-        return interpolated_centers, interpolated_sizes
-    
-    def exponential_smooth_velocity(self, new_velocity, old_velocity, alpha=0.3):
-        if not old_velocity:
-            return new_velocity
-        smoothed_vx = alpha * new_velocity[0] + (1 - alpha) * old_velocity[0]
-        smoothed_vy = alpha * new_velocity[1] + (1 - alpha) * old_velocity[1]
-        return (smoothed_vx, smoothed_vy)
-    
-    def draw_dotted_line(self, img, pt1, pt2, color, thickness, gap=8):
-        dist = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
+                tid = self.next_id
+                self.next_id += 1
+                self.tracks[tid] = {
+                    'center': (cx, cy), 'w': w, 'h': h,
+                    'history': deque([(cx, cy)], maxlen=TRAIL_MAX_LEN)
+                }
+                self.blob_names[tid] = random.choice(self.names_list)
+                assigned.append(tid)
+        for tid in unmatched:
+            del self.tracks[tid]
+            self.blob_names.pop(tid, None)
+        return assigned
+
+    def _draw_dotted_line(self, img, pt1, pt2, color, thickness, gap=8):
+        dist = np.sqrt((pt2[0]-pt1[0])**2 + (pt2[1]-pt1[1])**2)
         if dist == 0:
             return
-        dx = (pt2[0] - pt1[0]) / dist
-        dy = (pt2[1] - pt1[1]) / dist
-        current_dist = 0
-        dash_length = gap // 2
-        while current_dist < dist:
-            x1 = int(pt1[0] + dx * current_dist)
-            y1 = int(pt1[1] + dy * current_dist)
-            end_dist = min(current_dist + dash_length, dist)
-            x2 = int(pt1[0] + dx * end_dist)
-            y2 = int(pt1[1] + dy * end_dist)
-            cv2.line(img, (x1, y1), (x2, y2), color, thickness, cv2.LINE_4)
-            current_dist += gap
-    
-    def process_frame(self, frame, config):
+        dx, dy = (pt2[0]-pt1[0])/dist, (pt2[1]-pt1[1])/dist
+        d, dash = 0, gap // 2
+        while d < dist:
+            x1, y1 = int(pt1[0]+dx*d), int(pt1[1]+dy*d)
+            x2, y2 = int(pt1[0]+dx*min(d+dash,dist)), int(pt1[1]+dy*min(d+dash,dist))
+            cv2.line(img, (x1,y1), (x2,y2), color, thickness, cv2.LINE_4)
+            d += gap
+
+    def _draw_annotations(self, canvas, track_ids, config, out_w, out_h, is_alpha=False):
+        """
+        Dessine toutes les annotations sur canvas (BGR ou BGRA).
+        is_alpha=True : couleurs opaques sur fond transparent (export PNG).
+        is_alpha=False : couleurs sur fond vidéo (preview + mp4).
+        """
+        white = (255, 255, 255, 255) if is_alpha else (255, 255, 255)
+        col   = config['outline_color'] + (255,) if is_alpha else config['outline_color']
+        t_col = config['trail_color']   + (255,) if is_alpha else config['trail_color']
+        font  = cv2.FONT_HERSHEY_DUPLEX
+
+        for tid in track_ids:
+            track = self.tracks[tid]
+            cx, cy = int(track['center'][0]), int(track['center'][1])
+            w,  h  = int(track['w']),         int(track['h'])
+            x0 = np.clip(cx - w//2, 0, out_w)
+            y0 = np.clip(cy - h//2, 0, out_h)
+            x1 = np.clip(cx + w//2, 0, out_w)
+            y1 = np.clip(cy + h//2, 0, out_h)
+            th = config['blob_thickness']
+
+            # Trail Catmull-Rom entre tous les blobs
+            if config['draw_trails'] and len(track_ids) >= 2:
+                pts = [(int(self.tracks[t]['center'][0]),
+                        int(self.tracks[t]['center'][1])) for t in track_ids]
+                smooth_pts = self._catmull_rom(pts) if len(pts) >= 4 else pts
+                for i in range(len(smooth_pts)-1):
+                    pt1_ = (int(smooth_pts[i][0]),   int(smooth_pts[i][1]))
+                    pt2_ = (int(smooth_pts[i+1][0]), int(smooth_pts[i+1][1]))
+                    if config['use_dotted']:
+                        self._draw_dotted_line(canvas, pt1_, pt2_, t_col, config['trail_thickness'])
+                    else:
+                        cv2.line(canvas, pt1_, pt2_, t_col, config['trail_thickness'], cv2.LINE_4)
+
+            # Box ou brackets
+            if config['show_boxes']:
+                if config['use_brackets']:
+                    bw = int((x1-x0) * config['bracket_length'])
+                    bh = int((y1-y0) * config['bracket_length'])
+                    cv2.line(canvas, (x0,y0), (x0+bw,y0), col, th)
+                    cv2.line(canvas, (x0,y0), (x0,y0+bh), col, th)
+                    cv2.line(canvas, (x1,y0), (x1-bw,y0), col, th)
+                    cv2.line(canvas, (x1,y0), (x1,y0+bh), col, th)
+                    cv2.line(canvas, (x0,y1), (x0+bw,y1), col, th)
+                    cv2.line(canvas, (x0,y1), (x0,y1-bh), col, th)
+                    cv2.line(canvas, (x1,y1), (x1-bw,y1), col, th)
+                    cv2.line(canvas, (x1,y1), (x1,y1-bh), col, th)
+                else:
+                    cv2.rectangle(canvas, (x0,y0), (x1,y1), col, th)
+
+            # Point central
+            if config['show_center_dot']:
+                r       = config['center_dot_radius']
+                col_dot = config['center_dot_color'] + (255,) if is_alpha else config['center_dot_color']
+                if config['center_dot_style'] == 'cross':
+                    cs = r * 3
+                    cv2.line(canvas, (cx-cs,cy), (cx+cs,cy), col_dot, 2, cv2.LINE_4)
+                    cv2.line(canvas, (cx,cy-cs), (cx,cy+cs), col_dot, 2, cv2.LINE_4)
+                else:
+                    cv2.circle(canvas, (cx,cy), r, col_dot, -1)
+
+            # Label
+            if config['show_ids']:
+                name = self.blob_names.get(tid, f"ID{tid}")
+                text = f"{name} X:{cx} Y:{cy}"
+                fs, fth = config['fixed_font_scale'], config['fixed_font_thickness']
+                (tw, th_), _ = cv2.getTextSize(text, font, fs, fth)
+                tx = (x0+x1)//2 - tw//2
+                ty = max(y0 - config['fixed_font_offset'], th_)
+                if config['show_leaders']:
+                    cv2.line(canvas, (cx,cy), (tx+tw//2,ty), col, 1, cv2.LINE_4)
+                cv2.putText(canvas, text, (tx,ty), font, fs, white, fth, cv2.LINE_4)
+
+        # Connexions
+        if config['draw_connections'] and len(track_ids) > 1:
+            centers  = [(int(self.tracks[t]['center'][0]), int(self.tracks[t]['center'][1])) for t in track_ids]
+            avg_size = np.mean([int(self.tracks[t]['h']) for t in track_ids])
+            conn_th  = max(1, config['blob_thickness']//2)
+            for i in range(len(centers)):
+                for j in range(i+1, len(centers)):
+                    dx = centers[j][0]-centers[i][0]
+                    dy = centers[j][1]-centers[i][1]
+                    if np.sqrt(dx*dx+dy*dy) <= avg_size * 3:
+                        if config['use_dotted']:
+                            self._draw_dotted_line(canvas, centers[i], centers[j], col, conn_th)
+                        else:
+                            cv2.line(canvas, centers[i], centers[j], col, conn_th, cv2.LINE_4)
+
+        # Métriques
+        if config['show_metrics'] and track_ids:
+            fs, fth = config['fixed_font_scale'], config['fixed_font_thickness']
+            (_, lh), _ = cv2.getTextSize("A", font, fs, fth)
+            gap, y_pos = int(lh*1.8), int(lh*1.8)
+            cv2.putText(canvas, "TRACKING DATA", (10,y_pos), font, fs, col, fth, cv2.LINE_4)
+            y_pos += gap
+            for tid in track_ids:
+                t = self.tracks[tid]
+                cx_, cy_ = int(t['center'][0]), int(t['center'][1])
+                hist = list(t['history'])
+                spd = np.sqrt((hist[-1][0]-hist[-2][0])**2+(hist[-1][1]-hist[-2][1])**2) if len(hist)>=2 else 0.0
+                txt = f"ID:{tid} X:{cx_/out_w:.2f} Y:{cy_/out_h:.2f} SPD:{spd:.1f} {int(t['w'])}x{int(t['h'])}px"
+                cv2.putText(canvas, txt, (10,y_pos), font, fs, white, fth, cv2.LINE_4)
+                y_pos += gap
+
+        # Grille
+        if config['show_grid']:
+            gc = col  # même couleur avec alpha si besoin
+            x = 0
+            while x < out_w:
+                cv2.line(canvas, (int(x),0), (int(x),out_h), gc, 1, cv2.LINE_4)
+                x += config['grid_spacing']
+            y = 0
+            while y < out_h:
+                cv2.line(canvas, (0,int(y)), (out_w,int(y)), gc, 1, cv2.LINE_4)
+                y += config['grid_spacing']
+
+    def process_frame(self, frame, config, export_alpha=False):
+        out_h, out_w = frame.shape[:2]
+
+        # Threshold
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
         if config['threshold_mode'] == 'auto':
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
             _, thresh = cv2.threshold(gray, config['threshold_value'], 255, cv2.THRESH_BINARY)
-        
         if config['invert_threshold']:
             thresh = cv2.bitwise_not(thresh)
-        
-        out_h, out_w = frame.shape[:2]
-        
-        resolution_scale = config['resolution_scale']
-        if resolution_scale < 1.0:
-            detect_w = max(1, int(out_w * resolution_scale))
-            detect_h = max(1, int(out_h * resolution_scale))
-            thresh_detect = cv2.resize(thresh, (detect_w, detect_h), interpolation=cv2.INTER_AREA)
-            inv_scale = 1.0 / resolution_scale
+
+        # Downsample détection
+        res = config['resolution_scale']
+        if res < 1.0:
+            det_w = max(1, int(out_w * res))
+            det_h = max(1, int(out_h * res))
+            thresh_det = cv2.resize(thresh, (det_w, det_h), interpolation=cv2.INTER_AREA)
         else:
-            thresh_detect = thresh
-            detect_w, detect_h = out_w, out_h
-            inv_scale = 1.0
-        
-        self.frame_skip_cache['counter'] += 1
-        should_detect = True
-        frame_within_skip = self.frame_skip_cache['counter'] % config['frame_skip_interval']
-        
-        if config['enable_skip'] and frame_within_skip != 0:
-            should_detect = False
-            frame_fraction = frame_within_skip / config['frame_skip_interval']
-            centers, sizes_for_interp = self.smooth_interpolate_positions(
-                self.frame_skip_cache['smoothed_centers'],
-                self.frame_skip_cache['last_sizes'],
-                self.frame_skip_cache['smoothed_velocities'],
-                frame_fraction,
-                config['motion_smoothing']
-            )
-        
-        if should_detect:
-            area_scale = resolution_scale * resolution_scale
-            adjusted_min = max(1.0, config['min_area'] * area_scale)
-            adjusted_max = max(adjusted_min + 1, config['max_area'] * area_scale)
-            
-            params_tuple = (adjusted_min, adjusted_max, config['invert_threshold'])
-            if self.detector is None or self.last_params != params_tuple:
-                params = cv2.SimpleBlobDetector_Params()
-                params.minThreshold = 50
-                params.maxThreshold = 220
-                params.thresholdStep = 10
-                params.filterByArea = True
-                params.minArea = adjusted_min
-                params.maxArea = adjusted_max
-                params.filterByColor = True
-                params.blobColor = 255 if not config['invert_threshold'] else 0
-                params.filterByCircularity = False
-                params.filterByConvexity = False
-                params.filterByInertia = False
-                self.detector = cv2.SimpleBlobDetector_create(params)
-                self.last_params = params_tuple
-            
-            keypoints = self.detector.detect(thresh_detect)
-            
-            if len(keypoints) > config['max_blobs']:
-                keypoints = sorted(keypoints, key=lambda kp: kp.size, reverse=True)[:config['max_blobs']]
-            
-            self.frame_skip_cache['last_keypoints'] = keypoints
-            centers = None
-            sizes_for_interp = None
-        
+            thresh_det = thresh
+            det_w, det_h = out_w, out_h
+
+        sx, sy = out_w / det_w, out_h / det_h
+        area_scale = res * res
+        adj_min = max(1.0, config['min_area'] * area_scale)
+        adj_max = max(adj_min + 1, config['max_area'] * area_scale)
+
+        contours, _ = cv2.findContours(thresh_det, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filtered = [(c, cv2.boundingRect(c)) for c in contours
+                    if adj_min <= cv2.contourArea(c) <= adj_max]
+        filtered = sorted(filtered, key=lambda c: cv2.contourArea(c[0]), reverse=True)[:config['max_blobs']]
+
+        detections = [((x+w/2)*sx, (y+h/2)*sy, w*sx, h*sy) for _, (x,y,w,h) in filtered]
+        track_ids  = self._match_and_update(detections)
+
+        # ── Canvas vidéo (BGR) — preview + mp4
         out_img = frame.copy()
-        
-        scale_x = (out_w / detect_w) #* inv_scale
-        scale_y = (out_h / detect_h) #* inv_scale
-        scale_avg = (scale_x + scale_y) * 0.5
-        white = (255, 255, 255)
-        
-        if should_detect:
-            keypoints = self.frame_skip_cache['last_keypoints']
-            num_kps = len(keypoints)
-            
-            if num_kps > 0:
-                kp_data = np.array([[kp.pt[0], kp.pt[1], kp.size] for kp in keypoints], dtype=np.float32)
-                centers_x = (kp_data[:, 0] * scale_x).astype(np.int32)
-                centers_y = (kp_data[:, 1] * scale_y).astype(np.int32)
-                sizes_scaled = (kp_data[:, 2] * scale_avg).astype(np.int32)
-                detected_centers = list(zip(centers_x.tolist(), centers_y.tolist()))
-                sizes_for_interp = sizes_scaled.tolist()
-            
-                if self.frame_skip_cache['smoothed_sizes'] and len(self.frame_skip_cache['smoothed_sizes']) == len(sizes_for_interp):
-                    smoothed_sizes = []
-                    size_alpha = 0.3 + (config['size_smoothing'] * 0.4)
-                    for curr_size, prev_smooth_size in zip(sizes_for_interp, self.frame_skip_cache['smoothed_sizes']):
-                        smooth_size = int(size_alpha * curr_size + (1 - size_alpha) * prev_smooth_size)
-                        smoothed_sizes.append(smooth_size)
-                    self.frame_skip_cache['smoothed_sizes'] = smoothed_sizes
-                    sizes_scaled = np.array(smoothed_sizes, dtype=np.int32)
-                else:
-                    self.frame_skip_cache['smoothed_sizes'] = sizes_for_interp
-                
-                half_sizes = (sizes_scaled * 0.5).astype(np.int32)
-                
-                if (self.frame_skip_cache['last_centers'] and
-                        len(self.frame_skip_cache['last_centers']) == len(detected_centers)):
-                    raw_velocities = []
-                    smoothed_velocities = []
-                    for i, (curr, prev) in enumerate(zip(detected_centers, self.frame_skip_cache['last_centers'])):
-                        vel_x = (curr[0] - prev[0]) / config['frame_skip_interval']
-                        vel_y = (curr[1] - prev[1]) / config['frame_skip_interval']
-                        raw_vel = (vel_x, vel_y)
-                        raw_velocities.append(raw_vel)
-                        if i < len(self.frame_skip_cache['smoothed_velocities']):
-                            old_smooth_vel = self.frame_skip_cache['smoothed_velocities'][i]
-                            alpha_vel = 0.7 - (config['motion_smoothing'] * 0.5)
-                            smooth_vel = self.exponential_smooth_velocity(raw_vel, old_smooth_vel, alpha_vel)
-                        else:
-                            smooth_vel = raw_vel
-                        smoothed_velocities.append(smooth_vel)
-                    self.frame_skip_cache['velocities'] = raw_velocities
-                    self.frame_skip_cache['smoothed_velocities'] = smoothed_velocities
-                else:
-                    self.frame_skip_cache['velocities'] = [(0, 0)] * len(detected_centers)
-                    self.frame_skip_cache['smoothed_velocities'] = [(0, 0)] * len(detected_centers)
-                
-                if self.frame_skip_cache['smoothed_centers'] and len(self.frame_skip_cache['smoothed_centers']) == len(detected_centers):
-                    smoothed_centers = []
-                    center_alpha = 0.6
-                    for curr, prev_smooth in zip(detected_centers, self.frame_skip_cache['smoothed_centers']):
-                        smooth_x = int(center_alpha * curr[0] + (1 - center_alpha) * prev_smooth[0])
-                        smooth_y = int(center_alpha * curr[1] + (1 - center_alpha) * prev_smooth[1])
-                        smoothed_centers.append((smooth_x, smooth_y))
-                    self.frame_skip_cache['smoothed_centers'] = smoothed_centers
-                else:
-                    self.frame_skip_cache['smoothed_centers'] = detected_centers
-                
-                centers = self.frame_skip_cache['smoothed_centers']
-                self.frame_skip_cache['last_centers'] = detected_centers
-                self.frame_skip_cache['last_sizes'] = sizes_for_interp
-                
-                centers_x = np.array([c[0] for c in centers], dtype=np.int32)
-                centers_y = np.array([c[1] for c in centers], dtype=np.int32)
-                x0_arr = np.clip(centers_x - half_sizes, 0, out_w)
-                y0_arr = np.clip(centers_y - half_sizes, 0, out_h)
-                x1_arr = np.clip(centers_x + half_sizes, 0, out_w)
-                y1_arr = np.clip(centers_y + half_sizes, 0, out_h)
+        self._draw_annotations(out_img, track_ids, config, out_w, out_h, is_alpha=False)
 
-                #*****Affectation txt a chaque id
-                for i in range(num_kps):
-                    if i not in self.blob_names:
-                        # Si le nom existe deja pour cet ID, on le garde
-                        if i in self.blob_names:
-                            pass  # Garder le nom existant
-                        else:
-                            self.blob_names[i] = random.choice(self.names_list)
-                # Nettoyer txt
-                existing_ids = set(range(num_kps))
-                for blob_id in list(self.blob_names.keys()):
-                    if blob_id not in existing_ids:
-                        del self.blob_names[blob_id]
-            else:
-                centers = []
-                sizes_for_interp = []
-                num_kps = 0
-        else:
-            num_kps = len(centers) if centers else 0
-            if num_kps > 0:
-                centers_x = np.array([c[0] for c in centers], dtype=np.int32)
-                centers_y = np.array([c[1] for c in centers], dtype=np.int32)
-                sizes_scaled = np.array(sizes_for_interp, dtype=np.int32)
-                half_sizes = (sizes_scaled * 0.5).astype(np.int32)
-                x0_arr = np.clip(centers_x - half_sizes, 0, out_w)
-                y0_arr = np.clip(centers_y - half_sizes, 0, out_h)
-                x1_arr = np.clip(centers_x + half_sizes, 0, out_w)
-                y1_arr = np.clip(centers_y + half_sizes, 0, out_h)
-        
-                
-        if num_kps > 0:
-            if config['show_boxes']:
-                for i in range(num_kps):
-                    if config['use_brackets']:
-                        w = x1_arr[i] - x0_arr[i]
-                        h = y1_arr[i] - y0_arr[i]
-                        bracket_w = int(w * config['bracket_length'])
-                        bracket_h = int(h * config['bracket_length'])
-                        cv2.line(out_img, (x0_arr[i], y0_arr[i]), (x0_arr[i] + bracket_w, y0_arr[i]), config['outline_color'], config['blob_thickness'])
-                        cv2.line(out_img, (x0_arr[i], y0_arr[i]), (x0_arr[i], y0_arr[i] + bracket_h), config['outline_color'], config['blob_thickness'])
-                        cv2.line(out_img, (x1_arr[i], y0_arr[i]), (x1_arr[i] - bracket_w, y0_arr[i]), config['outline_color'], config['blob_thickness'])
-                        cv2.line(out_img, (x1_arr[i], y0_arr[i]), (x1_arr[i], y0_arr[i] + bracket_h), config['outline_color'], config['blob_thickness'])
-                        cv2.line(out_img, (x0_arr[i], y1_arr[i]), (x0_arr[i] + bracket_w, y1_arr[i]), config['outline_color'], config['blob_thickness'])
-                        cv2.line(out_img, (x0_arr[i], y1_arr[i]), (x0_arr[i], y1_arr[i] - bracket_h), config['outline_color'], config['blob_thickness'])
-                        cv2.line(out_img, (x1_arr[i], y1_arr[i]), (x1_arr[i] - bracket_w, y1_arr[i]), config['outline_color'], config['blob_thickness'])
-                        cv2.line(out_img, (x1_arr[i], y1_arr[i]), (x1_arr[i], y1_arr[i] - bracket_h), config['outline_color'], config['blob_thickness'])
-                    else:
-                        cv2.rectangle(out_img, (x0_arr[i], y0_arr[i]), (x1_arr[i], y1_arr[i]), config['outline_color'], config['blob_thickness'])
-                
-                # if config['show_ids'] or config['show_leaders']:
-                #     font = cv2.FONT_HERSHEY_SIMPLEX
-                #     for i in range(num_kps):
-                #         text_parts = []
-                #         if config['show_ids']:
-                #             text_parts.append(f"ID {i}")
-                #         if text_parts:
-                #             text = " ".join(text_parts)
-                #             h_box = y1_arr[i] - y0_arr[i]
-                #             font_scale = np.clip(h_box / 100, 0.25, 0.4)
-                #             (tw, th), _ = cv2.getTextSize(text, font, font_scale, 1)
-                #             tx = x0_arr[i]
-                #             ty = max(y0_arr[i] - 2, th)
-                #             if config['show_leaders']:
-                #                 cx = centers_x[i]
-                #                 cy = centers_y[i]
-                #                 cv2.line(out_img, (cx, cy), (tx, ty + th//2), config['outline_color'], 1, cv2.LINE_4)
-                #             cv2.putText(out_img, text, (tx, ty), font, font_scale, white, 1, cv2.LINE_4)
-            
-            if config['show_center_dot']:
-                for i in range(num_kps):
-                    cv2.circle(out_img, (centers_x[i], centers_y[i]), config['center_dot_radius'], config['center_dot_color'], -1)
+        # ── Canvas alpha (BGRA) — PNG export
+        alpha_img = None
+        if export_alpha:
+            alpha_img = np.zeros((out_h, out_w, 4), dtype=np.uint8)  # fond 100% transparent
+            self._draw_annotations(alpha_img, track_ids, config, out_w, out_h, is_alpha=True)
+            # Générer le canal alpha depuis les pixels dessinés
+            drawn_mask = np.any(alpha_img[:,:,:3] > 0, axis=2)
+            alpha_img[:,:,3] = np.where(drawn_mask, 255, 0)
 
-            if config['show_ids'] or config['show_leaders']:
-                font = cv2.FONT_HERSHEY_DUPLEX  # Police plus epaisse
-                FIXED_SCALE = config['fixed_font_scale']
-                FIXED_THICKNESS = config['fixed_font_thickness']
-                FIXED_OFFSET = config['fixed_font_offset']
-                
-                for i in range(num_kps):
-                    text_parts = []
-                    if config['show_ids']:
-                        x_pos = centers_x[i]
-                        y_pos = centers_y[i]
-                        #**pour random
-                        #blob_name = random.choice(self.names_list)
-                        #text_parts.append(f"ID:{i} X:{x_pos} Y:{y_pos}")
-                        blob_name = self.blob_names.get(i, f"ID{i}")
-                        text_parts.append(f"{blob_name} X:{x_pos} Y:{y_pos}")
-                    
-                    if text_parts:
-                        text = " ".join(text_parts)
-                        (tw, th), _ = cv2.getTextSize(text, font, FIXED_SCALE, FIXED_THICKNESS)
-                        
-                        # Centrer le texte au-dessus du rectangle
-                        rect_center_x = (x0_arr[i] + x1_arr[i]) // 2
-                        tx = rect_center_x - (tw // 2)
-                        ty = y0_arr[i] - FIXED_OFFSET
-                        
-                        # # Eviter de sortir de l'image
-                        # tx = max(2, min(tx, out_w - tw - 2))
-                        # if ty < th + 2:
-                        #     ty = y1_arr[i] + FIXED_OFFSET
-                        
-                        if config['show_leaders']:
-                            cx = centers_x[i]
-                            cy = centers_y[i]
-                            line_end_x = tx + (tw // 2)
-                            line_end_y = ty - (th // 2)
-                            cv2.line(out_img, (cx, cy), (line_end_x, line_end_y), config['outline_color'], 1, cv2.LINE_4)
-                        
-                        cv2.putText(out_img, text, (tx, ty), font, FIXED_SCALE, white, FIXED_THICKNESS, cv2.LINE_4)
-                        
-            if config['draw_connections'] and num_kps > 1:
-                avg_size = np.mean(y1_arr - y0_arr)
-                connection_distance = avg_size * 3
-                connection_thickness = max(1, int(config['blob_thickness'] * 0.5))
-                for i in range(num_kps):
-                    for j in range(i + 1, num_kps):
-                        dx = centers_x[j] - centers_x[i]
-                        dy = centers_y[j] - centers_y[i]
-                        dist = np.sqrt(dx*dx + dy*dy)
-                        if dist <= connection_distance:
-                            pt1 = (centers_x[i], centers_y[i])
-                            pt2 = (centers_x[j], centers_y[j])
-                            if config['use_dotted']:
-                                self.draw_dotted_line(out_img, pt1, pt2, config['outline_color'], connection_thickness)
-                            else:
-                                cv2.line(out_img, pt1, pt2, config['outline_color'], connection_thickness, cv2.LINE_4)
-            
-            if config['show_metrics']:
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.4
-                line_height = 20
-                padding = 10
-                panel_x = padding
-                y_pos = padding + line_height
-                cv2.putText(out_img, "TRACKING DATA", (panel_x, y_pos), font, font_scale, config['outline_color'], 1, cv2.LINE_4)
-                y_pos += int(line_height * 1.5)
-                for i in range(num_kps):
-                    x_norm = centers_x[i] / out_w
-                    y_norm = centers_y[i] / out_h
-                    size = y1_arr[i] - y0_arr[i]
-                    speed = 0.0
-                    if i < len(self.frame_skip_cache.get('smoothed_velocities', [])):
-                        vel = self.frame_skip_cache['smoothed_velocities'][i]
-                        speed = np.sqrt(vel[0]**2 + vel[1]**2)
-                    data_text = f"ID:{i} X:{x_norm:.2f} Y:{y_norm:.2f} SPD:{speed:.1f} SZ:{size}"
-                    cv2.putText(out_img, data_text, (panel_x, y_pos), font, font_scale * 0.9, white, 1, cv2.LINE_4)
-                    y_pos += line_height
-        
-        if config['show_grid']:
-            grid_col = tuple(int(c * 0.3) for c in config['outline_color'])
-            x = 0
-            while x < out_w:
-                cv2.line(out_img, (int(x), 0), (int(x), out_h), grid_col, 1, cv2.LINE_4)
-                x += config['grid_spacing']
-            y = 0
-            while y < out_h:
-                cv2.line(out_img, (0, int(y)), (out_w, int(y)), grid_col, 1, cv2.LINE_4)
-                y += config['grid_spacing']
-        
-        if config['draw_trails'] and centers and len(centers) >= 2:
-            trail_pts = centers
-            if len(trail_pts) >= 4:
-                trail_pts = self.interpolate_catmull_rom_cached(trail_pts, resolution=config['line_smoothness'])
-            if len(trail_pts) >= 2:
-                trail_array = np.array(trail_pts, dtype=np.float32)
-                diffs = trail_array[1:] - trail_array[:-1]
-                segment_lengths = np.sqrt(np.sum(diffs * diffs, axis=1))
-                full_length = np.sum(segment_lengths)
-                visible_length = full_length * np.clip(config['max_line_length'], 0.0, 1.0)
-                if visible_length < full_length:
-                    cumsum_rev = np.cumsum(segment_lengths[::-1])
-                    cutoff_idx = np.searchsorted(cumsum_rev, visible_length)
-                    if cutoff_idx < len(trail_pts) - 1:
-                        start_idx = max(0, len(trail_pts) - cutoff_idx - 2)
-                        trimmed = trail_pts[start_idx:]
-                    else:
-                        trimmed = trail_pts
-                else:
-                    trimmed = trail_pts
-                if len(trimmed) >= 2:
-                    if config['use_dotted']:
-                        for i in range(len(trimmed) - 1):
-                            pt1 = (int(trimmed[i][0]), int(trimmed[i][1]))
-                            pt2 = (int(trimmed[i+1][0]), int(trimmed[i+1][1]))
-                            self.draw_dotted_line(out_img, pt1, pt2, config['trail_color'], 1)
-                    else:
-                        pts = np.array(trimmed, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(out_img, [pts], False, config['trail_color'], config['trail_thickness'], cv2.LINE_4)
-        
-        return out_img
+        return out_img, alpha_img
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Blob Tracker - Standalone Application')
-    parser.add_argument('--input', type=str, default='0', help='Input video file or camera index (default: 0)')
-    parser.add_argument('--output', type=str, help='Output video file (optional)')
-    parser.add_argument('--threshold', type=int, default=127, help='Threshold value (default: 127)')
-    parser.add_argument('--min-area', type=float, default=10, help='Minimum blob area (default: 10)')
-    parser.add_argument('--max-area', type=float, default=1000, help='Maximum blob area (default: 1000)')
-    parser.add_argument('--max-blobs', type=int, default=100, help='Maximum number of blobs (default: 100)')
-    
+    parser = argparse.ArgumentParser(description='Blob Tracker 4K')
+    parser.add_argument('--input',      type=str,   default='0')
+    parser.add_argument('--output',     type=str,   default=None,
+                        help='Fichier video de sortie mp4 (ex: output/tracked.mp4)')
+    parser.add_argument('--png-output', type=str,   default=None,
+                        help='Dossier PNG alpha (ex: output/frames/)')
+    parser.add_argument('--threshold',  type=int,   default=127)
+    parser.add_argument('--min-area',   type=float, default=10000)
+    parser.add_argument('--max-area',   type=float, default=100000)
+    parser.add_argument('--max-blobs',  type=int,   default=20)
     args = parser.parse_args()
-    
-    tracker = BlobTracker()
-    
-    config = {
-        'threshold_mode': 'manual',
-        'threshold_value': args.threshold,
-        'invert_threshold': True,
-        'min_area': args.min_area,
-        'max_area': args.max_area,
-        'max_blobs': args.max_blobs,
-        'resolution_scale': 0.25, #ne pas toucher a ca pour 4k
-        'enable_skip': True,
-        'frame_skip_interval': 2,
-        'motion_smoothing': 0.1,
-        'size_smoothing': 0.1,
-        'outline_color': (255, 255, 255),
-        'trail_color': (255, 255, 255),
-        'trail_thickness': 2,
-        'blob_thickness': 3,
-        'draw_connections': True,
-        'draw_trails': False,
-        'line_smoothness': 8,
-        'max_line_length': 1.0,
-        'show_ids': True,
-        'show_leaders': False,
-        'show_metrics': False,
-        'show_grid': False,
-        'grid_spacing': 50.0,
-        'use_brackets': False,
-        'bracket_length': 0.3,
-        'use_dotted': False,
-        'show_boxes': True,
-        'show_center_dot': False,
-        'center_dot_radius': 4,
-        'center_dot_color': (255, 0, 255),
-        'fixed_font_scale': 1.2,        # Taille fixe pour la 4K
-        'fixed_font_thickness': 2,      # Epaisseur du texte
-        'fixed_font_offset': 15,        # Distance au-dessus du rectangle
 
+    tracker = BlobTracker()
+
+    config = {
+        'threshold_mode':       'manual',
+        'threshold_value':      args.threshold,
+        'invert_threshold':     False,
+        'min_area':             args.min_area,
+        'max_area':             args.max_area,
+        'max_blobs':            args.max_blobs,
+        'resolution_scale':     0.5,
+        'outline_color':        (255, 255, 255),
+        'trail_color':          (255, 255, 255),
+        'trail_thickness':      2,
+        'blob_thickness':       3,
+        'draw_connections':     True,
+        'draw_trails':          True,
+        'show_ids':             True,
+        'show_leaders':         False,
+        'show_metrics':         False,
+        'show_grid':            False,
+        'grid_spacing':         50.0,
+        'use_brackets':         False,
+        'bracket_length':       0.3,
+        'use_dotted':           False,
+        'show_boxes':           True,
+        'show_center_dot':      False,
+        'center_dot_style':     'dot',
+        'center_dot_radius':    4,
+        'center_dot_color':     (255, 255, 0),
+        'fixed_font_scale':     1.2,
+        'fixed_font_thickness': 2,
+        'fixed_font_offset':    15,
     }
-    
-    # 1. Ouvrir la capture EN PREMIER
+
     try:
         source = int(args.input)
     except ValueError:
         source = args.input
-    
+
     cap = cv2.VideoCapture(source)
-    
     if not cap.isOpened():
-        print(f"Error: Could not open video source {args.input}")
+        print(f"Error: Could not open {args.input}")
         return
-    
-    # 2. Lire les dims réelles APRES ouverture
+
     cap_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cap_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps   = int(cap.get(cv2.CAP_PROP_FPS))
-    
-    # 3. Fenêtre initiale respectant le ratio natif — redimensionnable à la souris
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
     INITIAL_W = 1280
     INITIAL_H = int(INITIAL_W * cap_h / cap_w)
-    
-    # namedWindow et resizeWindow UNE SEULE FOIS, JAMAIS dans la boucle
     cv2.namedWindow('Blob Tracker', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Blob Tracker', INITIAL_W, INITIAL_H)
-    
-    # 4. Writer en résolution 4K native
+
+    # Writer mp4
     writer = None
     if args.output:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(args.output, fourcc, fps, (cap_w, cap_h))
-    
-    print(f"Source 4K : {cap_w}x{cap_h}  |  Preview initial : {INITIAL_W}x{INITIAL_H}  |  FPS : {fps}")
+
+    # Dossier PNG alpha
+    export_alpha = args.png_output is not None
+    if export_alpha:
+        os.makedirs(args.png_output, exist_ok=True)
+        print(f"PNG alpha -> {args.png_output}/  ({total} frames attendues)")
+
+    print(f"Source 4K : {cap_w}x{cap_h}  |  Preview : {INITIAL_W}x{INITIAL_H}  |  FPS : {fps}")
     print("Fenetre redimensionnable a la souris")
-    print("Press 'q' to quit")
-    print("Press 't' to toggle trails")
-    print("Press 'c' to toggle connections")
-    print("Press 'b' to toggle brackets")
-    print("Press 'm' to toggle metrics")
-    print("Press 'g' to toggle grid")
-    print("Press 'd' to toggle dotted lines")
-    
+    print("q=quit  t=trails  c=connections  b=brackets  m=metrics  g=grid  d=dotted  x=boxes  p=dot")
+
+    frame_count = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        
-        # Tracker travaille en 4K natif — coords et annotations en 4K
-        output_4k = tracker.process_frame(frame, config)
 
-        # Write en 4K natif
+        output_4k, alpha_4k = tracker.process_frame(frame, config, export_alpha=export_alpha)
+
+        # Export mp4
         if writer:
             writer.write(output_4k)
-        
-        # imshow reçoit le 4K brut — WINDOW_NORMAL scale pour remplir la fenêtre
-        # l'utilisateur peut redimensionner la fenêtre librement à la souris
+
+        # Export PNG alpha
+        if export_alpha and alpha_4k is not None:
+            path = os.path.join(args.png_output, f"frame_{frame_count:06d}.png")
+            cv2.imwrite(path, alpha_4k)
+            if frame_count % 25 == 0:
+                print(f"  frame {frame_count}/{total}", end='\r')
+
         cv2.imshow('Blob Tracker', output_4k)
-        
+        frame_count += 1
+
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
+        if   key == ord('q'): break
         elif key == ord('t'):
             config['draw_trails'] = not config['draw_trails']
             print(f"Trails: {'ON' if config['draw_trails'] else 'OFF'}")
@@ -587,19 +365,28 @@ def main():
             print(f"Grid: {'ON' if config['show_grid'] else 'OFF'}")
         elif key == ord('d'):
             config['use_dotted'] = not config['use_dotted']
-            print(f"Dotted Lines: {'ON' if config['use_dotted'] else 'OFF'}")
+            print(f"Dotted: {'ON' if config['use_dotted'] else 'OFF'}")
         elif key == ord('x'):
             config['show_boxes'] = not config['show_boxes']
             print(f"Boxes: {'ON' if config['show_boxes'] else 'OFF'}")
-        elif key == ord('p'):  # 'p' pour point central
-            config['show_center_dot'] = not config['show_center_dot']
-            print(f"Center Dot: {'ON' if config['show_center_dot'] else 'OFF'}")
-    
+        elif key == ord('p'):
+            states = [('off', False, 'dot'), ('dot', True, 'dot'), ('cross', True, 'cross')]
+            current = 0 if not config['show_center_dot'] else (1 if config['center_dot_style'] == 'dot' else 2)
+            next_s  = (current + 1) % len(states)
+            label, config['show_center_dot'], config['center_dot_style'] = states[next_s]
+            print(f"Center: {label.upper()}")
+
     cap.release()
     if writer:
         writer.release()
     cv2.destroyAllWindows()
-    print("Done!")
+
+    if export_alpha:
+        print(f"\nDone! {frame_count} PNG alpha exportes dans {args.png_output}/")
+        print(f"Pour convertir en ProRes 4444 :")
+        print(f"  ffmpeg -framerate {fps} -i {args.png_output}/frame_%06d.png -c:v prores_ks -profile:v 4444 output/alpha.mov")
+    else:
+        print("Done!")
 
 
 if __name__ == '__main__':
