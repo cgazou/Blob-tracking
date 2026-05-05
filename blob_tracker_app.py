@@ -12,10 +12,9 @@ if getattr(sys, 'frozen', False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Puis pour charger config.txt
 config_path = os.path.join(APP_DIR, 'config.txt')
 
-# ── Paramètres trails ───────────────────────────────────────────────────────
+# Trail parameters
 TRAIL_MAX_LEN    = 40
 TRAIL_MATCH_DIST = 150
 
@@ -84,11 +83,6 @@ class BlobTracker:
             d += gap
 
     def _draw_annotations(self, canvas, track_ids, config, out_w, out_h, is_alpha=False):
-        """
-        Dessine toutes les annotations sur canvas (BGR ou BGRA).
-        is_alpha=True : couleurs opaques sur fond transparent (export PNG).
-        is_alpha=False : couleurs sur fond vidéo (preview + mp4).
-        """
         white = (255, 255, 255, 255) if is_alpha else (255, 255, 255)
         col   = config['outline_color'] + (255,) if is_alpha else config['outline_color']
         t_col = config['trail_color']   + (255,) if is_alpha else config['trail_color']
@@ -104,7 +98,6 @@ class BlobTracker:
             y1 = np.clip(cy + h//2, 0, out_h)
             th = config['blob_thickness']
 
-            # Trail Catmull-Rom entre tous les blobs
             if config['draw_trails'] and len(track_ids) >= 2:
                 pts = [(int(self.tracks[t]['center'][0]),
                         int(self.tracks[t]['center'][1])) for t in track_ids]
@@ -117,7 +110,6 @@ class BlobTracker:
                     else:
                         cv2.line(canvas, pt1_, pt2_, t_col, config['trail_thickness'], cv2.LINE_4)
 
-            # Box ou brackets
             if config['show_boxes']:
                 if config['use_brackets']:
                     bw = int((x1-x0) * config['bracket_length'])
@@ -133,7 +125,6 @@ class BlobTracker:
                 else:
                     cv2.rectangle(canvas, (x0,y0), (x1,y1), col, th)
 
-            # Point central
             if config['show_center_dot']:
                 r       = config['center_dot_radius']
                 col_dot = config['center_dot_color'] + (255,) if is_alpha else config['center_dot_color']
@@ -144,7 +135,6 @@ class BlobTracker:
                 else:
                     cv2.circle(canvas, (cx,cy), r, col_dot, -1)
 
-            # Label
             if config['show_ids']:
                 name = self.blob_names.get(tid, f"ID{tid}")
                 text = f"{name} X:{cx} Y:{cy}"
@@ -156,7 +146,6 @@ class BlobTracker:
                     cv2.line(canvas, (cx,cy), (tx+tw//2,ty), col, 1, cv2.LINE_4)
                 cv2.putText(canvas, text, (tx,ty), font, fs, white, fth, cv2.LINE_4)
 
-        # Connexions
         if config['draw_connections'] and len(track_ids) > 1:
             centers  = [(int(self.tracks[t]['center'][0]), int(self.tracks[t]['center'][1])) for t in track_ids]
             avg_size = np.mean([int(self.tracks[t]['h']) for t in track_ids])
@@ -171,7 +160,6 @@ class BlobTracker:
                         else:
                             cv2.line(canvas, centers[i], centers[j], col, conn_th, cv2.LINE_4)
 
-        # Métriques
         if config['show_metrics'] and track_ids:
             fs, fth = config['fixed_font_scale'], config['fixed_font_thickness']
             (_, lh), _ = cv2.getTextSize("A", font, fs, fth)
@@ -187,9 +175,8 @@ class BlobTracker:
                 cv2.putText(canvas, txt, (10,y_pos), font, fs, white, fth, cv2.LINE_4)
                 y_pos += gap
 
-        # Grille
         if config['show_grid']:
-            gc = col  # même couleur avec alpha si besoin
+            gc = col
             x = 0
             while x < out_w:
                 cv2.line(canvas, (int(x),0), (int(x),out_h), gc, 1, cv2.LINE_4)
@@ -202,7 +189,6 @@ class BlobTracker:
     def process_frame(self, frame, config, export_alpha=False):
         out_h, out_w = frame.shape[:2]
 
-        # Threshold
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if config['threshold_mode'] == 'auto':
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -211,7 +197,6 @@ class BlobTracker:
         if config['invert_threshold']:
             thresh = cv2.bitwise_not(thresh)
 
-        # Downsample détection
         res = config['resolution_scale']
         if res < 1.0:
             det_w = max(1, int(out_w * res))
@@ -234,32 +219,27 @@ class BlobTracker:
         detections = [((x+w/2)*sx, (y+h/2)*sy, w*sx, h*sy) for _, (x,y,w,h) in filtered]
         track_ids  = self._match_and_update(detections)
 
-        # ── Canvas vidéo (BGR) — preview + mp4
         out_img = frame.copy()
         self._draw_annotations(out_img, track_ids, config, out_w, out_h, is_alpha=False)
 
-        # ── Canvas alpha (BGRA) — PNG export
         alpha_img = None
         if export_alpha:
-            alpha_img = np.zeros((out_h, out_w, 4), dtype=np.uint8)  # fond 100% transparent
+            alpha_img = np.zeros((out_h, out_w, 4), dtype=np.uint8)
             self._draw_annotations(alpha_img, track_ids, config, out_w, out_h, is_alpha=True)
-            # Générer le canal alpha depuis les pixels dessinés
             drawn_mask = np.any(alpha_img[:,:,:3] > 0, axis=2)
             alpha_img[:,:,3] = np.where(drawn_mask, 255, 0)
 
         return out_img, alpha_img
 
 def load_config_from_file(config_file='config.txt'):
-    """Charge la configuration depuis un fichier texte (optionnel)"""
     config = {}
     
     if not os.path.exists(config_file):
-        print(f"Info: {config_file} non trouvé, utilisation des valeurs par défaut")
+        print(f"Info: {config_file} not found, using default values")
         return config
     
-    print(f"Info: chargement de la configuration depuis {config_file}")
+    print(f"Info: loading config from {config_file}")
     
-    # Pattern pour capturer KEY = VALUE
     pattern = re.compile(r'^\s*([A-Z_]+)\s*=\s*(.+?)\s*$', re.IGNORECASE)
     
     with open(config_file, 'r') as f:
@@ -271,13 +251,12 @@ def load_config_from_file(config_file='config.txt'):
             
             match = pattern.match(line)
             if not match:
-                print(f"Warning: ligne {line_num} ignorée: {line}")
+                print(f"Warning: line {line_num} ignored: {line}")
                 continue
             
             key = match.group(1).upper()
             value = match.group(2).strip()
             
-            # Conversion automatique
             if value.lower() in ('true', 'yes', 'on', '1'):
                 config[key] = True
             elif value.lower() in ('false', 'no', 'off', '0'):
@@ -293,7 +272,6 @@ def load_config_from_file(config_file='config.txt'):
     
     return config
 
-
 def main():
     parser = argparse.ArgumentParser(description='Blob Tracker 4K')
     parser.add_argument('--input',      type=str,   default='0')
@@ -307,7 +285,6 @@ def main():
 
     tracker = BlobTracker()
 
-    # Valeurs par defaut
     config = {
         'threshold_mode':       'manual',
         'threshold_value':      127,
@@ -340,10 +317,8 @@ def main():
         'fixed_font_offset':    15,
     }
     
-    # Charger le fichier config.txt s'il existe (optionnel)
     file_config = load_config_from_file('config.txt')
     
-    # Appliquer les valeurs du fichier (en ignorant la casse)
     for key, value in file_config.items():
         found = False
         for existing_key in config.keys():
@@ -354,7 +329,6 @@ def main():
         if not found:
             print(f"Warning: key '{key}' ignored (not found in config)")
     
-    # CLI arguments effacent
     if args.threshold is not None:
         config['threshold_value'] = args.threshold
     if args.min_area is not None:
@@ -384,20 +358,18 @@ def main():
     cv2.namedWindow('Blob Tracker', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Blob Tracker', INITIAL_W, INITIAL_H)
 
-    # Writer mp4
     writer = None
     if args.output:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(args.output, fourcc, fps, (cap_w, cap_h))
 
-    # Dossier PNG alpha
     export_alpha = args.png_output is not None
     if export_alpha:
         os.makedirs(args.png_output, exist_ok=True)
-        print(f"PNG alpha -> {args.png_output}/  ({total} frames attendues)")
+        print(f"PNG alpha -> {args.png_output}/  ({total} frames expected)")
 
     print(f"Source 4K : {cap_w}x{cap_h}  |  Preview : {INITIAL_W}x{INITIAL_H}  |  FPS : {fps}")
-    print("Fenetre redimensionnable a la souris")
+    print("Window resizable with mouse")
     print("q=quit  t=trails  c=connections  b=brackets  m=metrics  g=grid  d=dotted  x=boxes  p=dot")
 
     frame_count = 0
@@ -409,11 +381,9 @@ def main():
 
         output_4k, alpha_4k = tracker.process_frame(frame, config, export_alpha=export_alpha)
 
-        # Export mp4
         if writer:
             writer.write(output_4k)
 
-        # Export PNG alpha
         if export_alpha and alpha_4k is not None:
             folder_name = os.path.basename(args.png_output.rstrip('/\\'))
             path = os.path.join(args.png_output, f"{folder_name}_{frame_count:06d}.png")
@@ -460,12 +430,11 @@ def main():
     cv2.destroyAllWindows()
 
     if export_alpha:
-        print(f"\nDone! {frame_count} PNG alpha exportes dans {args.png_output}/")
-        print(f"Pour convertir en ProRes 4444 :")
-        print(f"  ffmpeg -framerate {fps} -i {args.png_output}/frame_%06d.png -c:v prores_ks -profile:v 4444 output/alpha.mov")
+        print(f"\nDone! {frame_count} PNG alpha exported to {args.png_output}/")
+        print(f"To convert to ProRes 4444:")
+        print(f"  ffmpeg -framerate {fps} -i {args.png_output}/folder_%06d.png -c:v prores_ks -profile:v 4444 output/alpha.mov")
     else:
         print("Done!")
-
 
 if __name__ == '__main__':
     main()

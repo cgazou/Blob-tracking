@@ -25,6 +25,7 @@ wheels/
 *.egg
 
 # IDE
+.vs/
 .vscode/
 .idea/
 *.swp
