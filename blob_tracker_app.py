@@ -18,13 +18,35 @@ config_path = os.path.join(APP_DIR, 'config.txt')
 TRAIL_MAX_LEN    = 40
 TRAIL_MATCH_DIST = 150
 
+
+def load_names_from_config(config_file='config.txt'):
+    """Load blob names from config file"""
+    names = []
+    
+    if not os.path.exists(config_file):
+        return names
+    
+    pattern = re.compile(r'^\s*BLOB_NAMES\s*=\s*(.+?)\s*$', re.IGNORECASE)
+    
+    with open(config_file, 'r') as f:
+        for line in f:
+            match = pattern.match(line)
+            if match:
+                names_str = match.group(1).strip()
+                # Split by comma and clean each name
+                names = [n.strip() for n in names_str.split(',') if n.strip()]
+                break
+    
+    return names
+
+
+
 class BlobTracker:
-    def __init__(self):
+    def __init__(self, names_list: list = None):
         self.tracks     = {}
         self.next_id    = 0
         self.blob_names = {}
-        self.names_list = ['real','double','station','world','dream',
-                           'bizoocross','helmut','only','path','2world']
+        self.names_list = names_list
 
     def _catmull_rom(self, pts, resolution=8):
         if len(pts) < 4:
@@ -63,7 +85,10 @@ class BlobTracker:
                     'center': (cx, cy), 'w': w, 'h': h,
                     'history': deque([(cx, cy)], maxlen=TRAIL_MAX_LEN)
                 }
-                self.blob_names[tid] = random.choice(self.names_list)
+                if self.names_list:
+                    self.blob_names[tid] = random.choice(self.names_list)
+                else:
+                    self.blob_names[tid] = f"ID{tid}"
                 assigned.append(tid)
         for tid in unmatched:
             del self.tracks[tid]
@@ -231,6 +256,9 @@ class BlobTracker:
 
         return out_img, alpha_img
 
+
+
+
 def load_config_from_file(config_file='config.txt'):
     config = {}
     
@@ -281,9 +309,16 @@ def main():
     parser.add_argument('--min-area',   type=float, default=None)
     parser.add_argument('--max-area',   type=float, default=None)
     parser.add_argument('--max-blobs',  type=int,   default=None)
-    args = parser.parse_args()
 
-    tracker = BlobTracker()
+    args = parser.parse_args()
+    custom_names = load_names_from_config('config.txt')
+    if custom_names:
+        print(f"Info: loaded {len(custom_names)} custom names")
+        tracker = BlobTracker(names_list=custom_names)
+    else:
+        print("Info: no custom names, using IDs")
+        tracker = BlobTracker()
+
 
     config = {
         'threshold_mode':       'manual',
@@ -318,7 +353,6 @@ def main():
     }
     
     file_config = load_config_from_file('config.txt')
-    
     for key, value in file_config.items():
         found = False
         for existing_key in config.keys():
@@ -326,7 +360,7 @@ def main():
                 config[existing_key] = value
                 found = True
                 break
-        if not found:
+        if not found and key not in ['BLOB_NAMES']:
             print(f"Warning: key '{key}' ignored (not found in config)")
     
     if args.threshold is not None:

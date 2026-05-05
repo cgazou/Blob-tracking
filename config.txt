@@ -24,7 +24,7 @@ BLOB_THICKNESS = 3
 # Features
 DRAW_CONNECTIONS = True
 DRAW_TRAILS = True
-SHOW_IDS = False
+SHOW_IDS = True
 SHOW_LEADERS = False
 SHOW_METRICS = False
 SHOW_GRID = False
@@ -33,6 +33,11 @@ USE_BRACKETS = False
 BRACKET_LENGTH = 0.3
 USE_DOTTED = False
 SHOW_BOXES = True
+
+# NAMES FOR BLOBS (separate by commas)
+# If empty or missing, will use IDs instead
+BLOB_NAMES = ???, unknown
+# BLOB_NAMES = real, double, station, world, dream, bizoocross, helmut, only, path, 2world
 
 # Center dot
 SHOW_CENTER_DOT = False
