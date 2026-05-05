@@ -2,9 +2,18 @@ import numpy as np
 import cv2
 import argparse
 import random
+import sys
 import os
 import re
 from collections import deque
+
+if getattr(sys, 'frozen', False):
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Puis pour charger config.txt
+config_path = os.path.join(APP_DIR, 'config.txt')
 
 # ── Paramètres trails ───────────────────────────────────────────────────────
 TRAIL_MAX_LEN    = 40

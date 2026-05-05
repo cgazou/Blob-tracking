@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Blob Tracker 4K - Simple Menu
-"""
 
 import os
 import sys
 import subprocess
 
-# Get the directory where the app is located
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# Get the directory where the app is located (works for .exe and script)
+if getattr(sys, 'frozen', False):
+    # Running as compiled .exe
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    # Running as script
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 OUTPUT_DIR = os.path.join(APP_DIR, "output")
 
 # Create output directory if it doesn't exist
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
-    print(f"[INFO] Created output directory: output/")
+    print(f"[INFO] Created output directory: {OUTPUT_DIR}")
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -42,6 +45,7 @@ def show_config():
     print()
     print("=" * 50)
     return True
+
 
 def main():
     print("\n" + "=" * 50)
