@@ -3,6 +3,7 @@ import cv2
 import argparse
 import random
 import os
+import re
 from collections import deque
 
 # ── Paramètres trails ───────────────────────────────────────────────────────
@@ -239,29 +240,72 @@ class BlobTracker:
 
         return out_img, alpha_img
 
+def load_config_from_file(config_file='config.txt'):
+    """Charge la configuration depuis un fichier texte (optionnel)"""
+    config = {}
+    
+    if not os.path.exists(config_file):
+        print(f"Info: {config_file} non trouvé, utilisation des valeurs par défaut")
+        return config
+    
+    print(f"Info: chargement de la configuration depuis {config_file}")
+    
+    # Pattern pour capturer KEY = VALUE
+    pattern = re.compile(r'^\s*([A-Z_]+)\s*=\s*(.+?)\s*$', re.IGNORECASE)
+    
+    with open(config_file, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            
+            if not line or line.startswith('#'):
+                continue
+            
+            match = pattern.match(line)
+            if not match:
+                print(f"Warning: ligne {line_num} ignorée: {line}")
+                continue
+            
+            key = match.group(1).upper()
+            value = match.group(2).strip()
+            
+            # Conversion automatique
+            if value.lower() in ('true', 'yes', 'on', '1'):
+                config[key] = True
+            elif value.lower() in ('false', 'no', 'off', '0'):
+                config[key] = False
+            elif value.isdigit():
+                config[key] = int(value)
+            elif re.match(r'^\d+\.\d+$', value):
+                config[key] = float(value)
+            elif re.match(r'^\d+,\d+,\d+$', value):
+                config[key] = tuple(int(x) for x in value.split(','))
+            else:
+                config[key] = value
+    
+    return config
+
 
 def main():
     parser = argparse.ArgumentParser(description='Blob Tracker 4K')
     parser.add_argument('--input',      type=str,   default='0')
-    parser.add_argument('--output',     type=str,   default=None,
-                        help='Fichier video de sortie mp4 (ex: output/tracked.mp4)')
-    parser.add_argument('--png-output', type=str,   default=None,
-                        help='Dossier PNG alpha (ex: output/frames/)')
-    parser.add_argument('--threshold',  type=int,   default=127)
-    parser.add_argument('--min-area',   type=float, default=10000)
-    parser.add_argument('--max-area',   type=float, default=100000)
-    parser.add_argument('--max-blobs',  type=int,   default=20)
+    parser.add_argument('--output',     type=str,   default=None)
+    parser.add_argument('--png-output', type=str,   default=None)
+    parser.add_argument('--threshold',  type=int,   default=None)
+    parser.add_argument('--min-area',   type=float, default=None)
+    parser.add_argument('--max-area',   type=float, default=None)
+    parser.add_argument('--max-blobs',  type=int,   default=None)
     args = parser.parse_args()
 
     tracker = BlobTracker()
 
+    # Valeurs par defaut
     config = {
         'threshold_mode':       'manual',
-        'threshold_value':      args.threshold,
+        'threshold_value':      127,
         'invert_threshold':     False,
-        'min_area':             args.min_area,
-        'max_area':             args.max_area,
-        'max_blobs':            args.max_blobs,
+        'min_area':             10000,
+        'max_area':             100000,
+        'max_blobs':            20,
         'resolution_scale':     0.5,
         'outline_color':        (255, 255, 255),
         'trail_color':          (255, 255, 255),
@@ -286,7 +330,31 @@ def main():
         'fixed_font_thickness': 2,
         'fixed_font_offset':    15,
     }
-
+    
+    # Charger le fichier config.txt s'il existe (optionnel)
+    file_config = load_config_from_file('config.txt')
+    
+    # Appliquer les valeurs du fichier (en ignorant la casse)
+    for key, value in file_config.items():
+        found = False
+        for existing_key in config.keys():
+            if existing_key.upper() == key:
+                config[existing_key] = value
+                found = True
+                break
+        if not found:
+            print(f"Warning: key '{key}' ignored (not found in config)")
+    
+    # CLI arguments effacent
+    if args.threshold is not None:
+        config['threshold_value'] = args.threshold
+    if args.min_area is not None:
+        config['min_area'] = args.min_area
+    if args.max_area is not None:
+        config['max_area'] = args.max_area
+    if args.max_blobs is not None:
+        config['max_blobs'] = args.max_blobs
+    
     try:
         source = int(args.input)
     except ValueError:
@@ -338,7 +406,8 @@ def main():
 
         # Export PNG alpha
         if export_alpha and alpha_4k is not None:
-            path = os.path.join(args.png_output, f"frame_{frame_count:06d}.png")
+            folder_name = os.path.basename(args.png_output.rstrip('/\\'))
+            path = os.path.join(args.png_output, f"{folder_name}_{frame_count:06d}.png")
             cv2.imwrite(path, alpha_4k)
             if frame_count % 25 == 0:
                 print(f"  frame {frame_count}/{total}", end='\r')
