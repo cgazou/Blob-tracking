@@ -7,9 +7,9 @@ THRESHOLD_VALUE = 120
 INVERT_THRESHOLD = False
 
 # Area settings
-MIN_AREA = 10000
-MAX_AREA = 25000
-MAX_BLOBS = 10
+MIN_AREA = 40000
+MAX_AREA = 85000
+MAX_BLOBS = 2
 
 # Resolution and performance
 # FOR 4K: 0.5
@@ -19,11 +19,11 @@ RESOLUTION_SCALE = 0.5
 OUTLINE_COLOR = 255,255,255
 TRAIL_COLOR = 255,255,255
 TRAIL_THICKNESS = 2
-BLOB_THICKNESS = 3
+BLOB_THICKNESS = 2
 
 # Features
 DRAW_CONNECTIONS = True
-DRAW_TRAILS = True
+DRAW_TRAILS = False
 SHOW_IDS = True
 SHOW_LEADERS = False
 SHOW_METRICS = False
@@ -36,16 +36,17 @@ SHOW_BOXES = True
 
 # NAMES FOR BLOBS (separate by commas)
 # If empty or missing, will use IDs instead
-BLOB_NAMES = ???, unknown
+BLOB_NAMES = ???, unknown, world, jill, helmut, dream, real, dream, game, life, artificial, double, station, awareness, death, human, avatar, identity
 # BLOB_NAMES = real, double, station, world, dream, bizoocross, helmut, only, path, 2world
+#BLOB_NAMES = path, race, pilote
 
 # Center dot
-SHOW_CENTER_DOT = False
-CENTER_DOT_STYLE = dot
+SHOW_CENTER_DOT = True
+CENTER_DOT_STYLE = cross
 CENTER_DOT_RADIUS = 4
-CENTER_DOT_COLOR = 255,255,0
+CENTER_DOT_COLOR = 255,255,255
 
 # Font
-FIXED_FONT_SCALE = 1.2
+FIXED_FONT_SCALE = 1
 FIXED_FONT_THICKNESS = 2
-FIXED_FONT_OFFSET = 15
+FIXED_FONT_OFFSET = 14

@@ -5,6 +5,12 @@ import os
 import sys
 import subprocess
 
+# Python command (works both in script and exe)
+if getattr(sys, 'frozen', False):
+    PYTHON_CMD = "python"
+else:
+    PYTHON_CMD = sys.executable
+
 # Get the directory where the app is located
 if getattr(sys, 'frozen', False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -16,18 +22,12 @@ else:
 # Find path to blob_tracker_app.py
 script_path = os.path.join(base_path, "blob_tracker_app.py")
 
-# Path to embedded ffmpeg (for Windows exe)
-if getattr(sys, 'frozen', False) and sys.platform == 'win32':
-    FFMPEG_PATH = os.path.join(base_path, "ffmpeg.exe")
-else:
-    FFMPEG_PATH = "ffmpeg"
-
 OUTPUT_DIR = os.path.join(APP_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Colors for terminal
 class Colors:
-    HOT_PINK = '\033[95m'    # Bright magenta / hot pink
+    HOT_PINK = '\033[95m'
     RESET = '\033[0m'
 
 # ASCII Art Whale
@@ -47,10 +47,8 @@ def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def show_menu():
-    """Display menu with whale ASCII art in hot pink"""
     clear_screen()
     
-    # Print everything in hot pink
     for line in WHALE.split('\n'):
         print(Colors.HOT_PINK + line + Colors.RESET)
     
@@ -81,42 +79,6 @@ def check_video_format(file_path):
         print(Colors.HOT_PINK + "Recommended format: MP4 (H.264)" + Colors.RESET)
         response = input(Colors.HOT_PINK + "Continue anyway? (y/N): " + Colors.RESET).strip().lower()
         return response == 'y' or response == 'yes'
-
-def check_ffmpeg():
-    """Check if ffmpeg is available (embedded or system)"""
-    if os.path.exists(FFMPEG_PATH):
-        return True
-    try:
-        subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, check=True)
-        return True
-    except:
-        return False
-
-def convert_to_prores(png_folder, fps=25):
-    """Convert PNG sequence to ProRes 4444 using ffmpeg"""
-    folder_name = os.path.basename(png_folder.rstrip('/\\'))
-    output_mov = os.path.join(os.path.dirname(png_folder), f"{folder_name}_prores.mov")
-    
-    print(Colors.HOT_PINK + f"\nConverting to ProRes 4444..." + Colors.RESET)
-    print(Colors.HOT_PINK + f"Input: {png_folder}/{folder_name}_*.png" + Colors.RESET)
-    print(Colors.HOT_PINK + f"Output: {output_mov}" + Colors.RESET)
-    print(Colors.HOT_PINK + f"FPS: {fps}" + Colors.RESET)
-    print()
-    
-    cmd = [
-        FFMPEG_PATH, "-y",
-        "-framerate", str(fps),
-        "-i", f"{png_folder}/{folder_name}_%06d.png",
-        "-c:v", "prores_ks",
-        "-profile:v", "4444",
-        "-pix_fmt", "yuva444p10le",
-        "-vendor", "apl0",
-        "-bits_per_mb", "8000",
-        output_mov
-    ]
-    
-    result = subprocess.run(cmd)
-    return result.returncode == 0, output_mov
 
 def main():
     while True:
@@ -162,7 +124,7 @@ def main():
             mp4_path = os.path.join(OUTPUT_DIR, f"{folder_name}.mp4")
             
             cmd = [
-                sys.executable, script_path,
+                PYTHON_CMD, script_path,
                 "--input", video_path,
                 "--output", mp4_path,
                 "--png-output", output_path
@@ -179,7 +141,7 @@ def main():
             output_path = os.path.join(OUTPUT_DIR, f"{mp4_name}.mp4")
             
             cmd = [
-                sys.executable, script_path,
+                PYTHON_CMD, script_path,
                 "--input", video_path,
                 "--output", output_path
             ]
@@ -192,31 +154,11 @@ def main():
         
         result = subprocess.run(cmd)
         
-        print()
         if result.returncode == 0:
-            print(Colors.HOT_PINK + "[SUCCESS] Tracking completed!" + Colors.RESET)
-            
-            if export_choice == '2':
-                ffmpeg_ok = check_ffmpeg()
-                
-                if ffmpeg_ok:
-                    print()
-                    print(Colors.HOT_PINK + "=" * 40 + Colors.RESET)
-                    convert = input(Colors.HOT_PINK + "Convert PNG sequence to ProRes 4444? (y/N): " + Colors.RESET).strip().lower()
-                    if convert == 'y' or convert == 'yes':
-                        fps_input = input(Colors.HOT_PINK + "Frame rate (default: 25): " + Colors.RESET).strip()
-                        fps = int(fps_input) if fps_input.isdigit() else 25
-                        
-                        success, prores_path = convert_to_prores(output_path, fps)
-                        if success:
-                            print(Colors.HOT_PINK + f"\n[SUCCESS] ProRes 4444 created: {prores_path}" + Colors.RESET)
-                        else:
-                            print(Colors.HOT_PINK + "\n[ERROR] ProRes conversion failed" + Colors.RESET)
-                else:
-                    print(Colors.HOT_PINK + "\n[INFO] ffmpeg not found." + Colors.RESET)
-                    print(Colors.HOT_PINK + "Download: https://ffmpeg.org/download.html" + Colors.RESET)
+            print(Colors.HOT_PINK + "\n[SUCCESS] Tracking completed!" + Colors.RESET)
+            print(Colors.HOT_PINK + f"\nFiles saved in: {OUTPUT_DIR}" + Colors.RESET)
         else:
-            print(Colors.HOT_PINK + "[ERROR] Tracking failed" + Colors.RESET)
+            print(Colors.HOT_PINK + "\n[ERROR] Tracking failed" + Colors.RESET)
         
         input(Colors.HOT_PINK + "\nPress Enter to continue..." + Colors.RESET)
 

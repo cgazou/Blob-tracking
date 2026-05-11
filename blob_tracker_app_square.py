@@ -3,10 +3,12 @@ import cv2
 import argparse
 import random
 import os
+import re
 from collections import deque
+import glob
 
 class BlobTracker:
-    def __init__(self):
+    def __init__(self, names_list=None):
         self.detector = None
         self.last_params = None
         
@@ -30,10 +32,8 @@ class BlobTracker:
             [-1, 3, -3, 1]
         ], dtype=np.float32)
 
-        self.names_list = [
-            'path',
-            'pilote'
-        ]
+        # Use provided names list or default
+        self.names_list = names_list if names_list else ['path', 'pilote']
         self.blob_names = {}
 
     
@@ -112,7 +112,7 @@ class BlobTracker:
             cv2.line(img, (x1, y1), (x2, y2), color, thickness, cv2.LINE_4)
             current_dist += gap
     
-    def process_frame(self, frame, config, export_alpha=False):
+    def process_frame(self, frame, config, export_alpha=False, mask_frames=None, frame_index=0):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         if config['threshold_mode'] == 'auto':
@@ -138,6 +138,13 @@ class BlobTracker:
         
         self.frame_skip_cache['counter'] += 1
         should_detect = True
+
+        # Apply animated mask — masked zones excluded from detection
+        if mask_frames and should_detect:
+            mask = mask_frames[frame_index % len(mask_frames)]
+            if mask.shape[:2] != (detect_h, detect_w):
+                mask = cv2.resize(mask, (detect_w, detect_h), interpolation=cv2.INTER_NEAREST)
+            thresh_detect[mask > 0] = 0
         frame_within_skip = self.frame_skip_cache['counter'] % config['frame_skip_interval']
         
         if config['enable_skip'] and frame_within_skip != 0:
@@ -314,7 +321,14 @@ class BlobTracker:
             
             if config['show_center_dot']:
                 for i in range(num_kps):
-                    cv2.circle(out_img, (centers_x[i], centers_y[i]), config['center_dot_radius'], config['center_dot_color'], -1)
+                    r = config['center_dot_radius']
+                    if config['center_dot_style'] == 'cross':
+                        cross_size = r * 3
+                        thickness = max(1, r // 2)
+                        cv2.line(out_img, (centers_x[i] - cross_size, centers_y[i]), (centers_x[i] + cross_size, centers_y[i]), config['center_dot_color'], thickness, cv2.LINE_4)
+                        cv2.line(out_img, (centers_x[i], centers_y[i] - cross_size), (centers_x[i], centers_y[i] + cross_size), config['center_dot_color'], thickness, cv2.LINE_4)
+                    else:
+                        cv2.circle(out_img, (centers_x[i], centers_y[i]), r, config['center_dot_color'], -1)
 
             if config['show_ids'] or config['show_leaders']:
                 font = cv2.FONT_HERSHEY_DUPLEX
@@ -435,7 +449,14 @@ class BlobTracker:
                 if config['show_boxes']:
                     cv2.rectangle(alpha_img, (x0_arr[i], y0_arr[i]), (x1_arr[i], y1_arr[i]), config['outline_color'], config['blob_thickness'])
                 if config['show_center_dot']:
-                    cv2.circle(alpha_img, (centers_x[i], centers_y[i]), config['center_dot_radius'], config['center_dot_color'], -1)
+                    r = config['center_dot_radius']
+                    if config['center_dot_style'] == 'cross':
+                        cross_size = r * 3
+                        thickness = max(1, r // 2)
+                        cv2.line(alpha_img, (centers_x[i] - cross_size, centers_y[i]), (centers_x[i] + cross_size, centers_y[i]), config['center_dot_color'], thickness, cv2.LINE_4)
+                        cv2.line(alpha_img, (centers_x[i], centers_y[i] - cross_size), (centers_x[i], centers_y[i] + cross_size), config['center_dot_color'], thickness, cv2.LINE_4)
+                    else:
+                        cv2.circle(alpha_img, (centers_x[i], centers_y[i]), r, config['center_dot_color'], -1)
                 if config['show_ids']:
                     name = self.blob_names.get(i, f"ID{i}")
                     text = f"{name} X:{centers_x[i]} Y:{centers_y[i]}"
@@ -453,39 +474,102 @@ class BlobTracker:
         return out_img, alpha_img
 
 
+def load_config_from_file(config_file='config.txt'):
+    """Load configuration from text file"""
+    config = {}
+    
+    if not os.path.exists(config_file):
+        print(f"Info: {config_file} not found, using default values")
+        return config
+    
+    print(f"Info: loading config from {config_file}")
+    
+    pattern = re.compile(r'^\s*([A-Z_]+)\s*=\s*(.+?)\s*$', re.IGNORECASE)
+    
+    with open(config_file, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            
+            if not line or line.startswith('#'):
+                continue
+            
+            match = pattern.match(line)
+            if not match:
+                print(f"Warning: line {line_num} ignored: {line}")
+                continue
+            
+            key = match.group(1).upper()
+            value = match.group(2).strip()
+            
+            # Handle colors with commas
+            if re.match(r'^\d+,\d+,\d+$', value):
+                config[key] = tuple(int(x) for x in value.split(','))
+            elif value.lower() in ('true', 'yes', 'on', '1'):
+                config[key] = True
+            elif value.lower() in ('false', 'no', 'off', '0'):
+                config[key] = False
+            elif value.isdigit():
+                config[key] = int(value)
+            elif re.match(r'^\d+\.\d+$', value):
+                config[key] = float(value)
+            else:
+                config[key] = value
+    
+    return config
+
+
+def load_names_from_config(config_file='config.txt'):
+    """Load blob names from config file"""
+    names = []
+    
+    if not os.path.exists(config_file):
+        return names
+    
+    pattern = re.compile(r'^\s*BLOB_NAMES\s*=\s*(.+?)\s*$', re.IGNORECASE)
+    
+    with open(config_file, 'r') as f:
+        for line in f:
+            match = pattern.match(line)
+            if match:
+                names_str = match.group(1).strip()
+                names = [n.strip() for n in names_str.split(',') if n.strip()]
+                break
+    
+    return names
+
+
 def main():
     parser = argparse.ArgumentParser(description='Blob Tracker - Standalone Application')
     parser.add_argument('--input', type=str, default='0', help='Input video file or camera index (default: 0)')
     parser.add_argument('--output', type=str, help='Output video file (optional)')
     parser.add_argument('--png-output', type=str, help='Output folder for PNG sequence with alpha (optional)')
-    parser.add_argument('--threshold', type=int, default=127, help='Threshold value (default: 127)')
-    parser.add_argument('--min-area', type=float, default=10, help='Minimum blob area (default: 10)')
-    parser.add_argument('--max-area', type=float, default=1000, help='Maximum blob area (default: 1000)')
-    parser.add_argument('--max-blobs', type=int, default=100, help='Maximum number of blobs (default: 100)')
+    parser.add_argument('--threshold', type=int, default=None, help='Threshold value (overrides config)')
+    parser.add_argument('--min-area', type=float, default=None, help='Minimum blob area (overrides config)')
+    parser.add_argument('--max-area', type=float, default=None, help='Maximum blob area (overrides config)')
+    parser.add_argument('--max-blobs', type=int, default=None, help='Maximum number of blobs (overrides config)')
     
     args = parser.parse_args()
     
-    tracker = BlobTracker()
-    
+  # Default configuration
     config = {
         'threshold_mode': 'manual',
-        'threshold_value': args.threshold,
+        'threshold_value': 127,
         'invert_threshold': True,
-        'min_area': args.min_area,
-        'max_area': args.max_area,
-        'max_blobs': args.max_blobs,
-        'resolution_scale': 0.25,
-        'enable_skip': True,
-        'frame_skip_interval': 2,
-        'motion_smoothing': 0.1,
-        'size_smoothing': 0.1,
+        'min_area': 40000,
+        'max_area': 85000,
+        'max_blobs': 2,
+        'resolution_scale': 0.5,
+        'enable_skip': True,                    
+        'frame_skip_interval': 2,               
+        'motion_smoothing': 0.5,                
+        'size_smoothing': 0.5,                  
         'outline_color': (255, 255, 255),
         'trail_color': (255, 255, 255),
         'trail_thickness': 2,
-        'blob_thickness': 3,
+        'blob_thickness': 2,
         'draw_connections': True,
         'draw_trails': False,
-        'line_smoothness': 8,
+        'line_smoothness': 8,                  
         'max_line_length': 1.0,
         'show_ids': True,
         'show_leaders': False,
@@ -497,12 +581,40 @@ def main():
         'use_dotted': False,
         'show_boxes': True,
         'show_center_dot': False,
+        'center_dot_style': 'cross',
         'center_dot_radius': 4,
-        'center_dot_color': (255, 0, 255),
-        'fixed_font_scale': 1.2,
+        'center_dot_color': (255, 255, 255),
+        'fixed_font_scale': 1,
         'fixed_font_thickness': 2,
-        'fixed_font_offset': 15,
-    }
+        'fixed_font_offset': 14,
+}
+    
+    # Load config from file
+    file_config = load_config_from_file('config.txt')
+    for key, value in file_config.items():
+        if key in config:
+            config[key] = value
+        elif key not in ['BLOB_NAMES']:
+            print(f"Warning: key '{key}' ignored (not found in config)")
+    
+    # Load custom names from config
+    custom_names = load_names_from_config('config.txt')
+    if custom_names:
+        print(f"Info: loaded {len(custom_names)} custom names")
+        tracker = BlobTracker(names_list=custom_names)
+    else:
+        print("Info: no custom names, using defaults")
+        tracker = BlobTracker()
+    
+    # Override with CLI arguments
+    if args.threshold is not None:
+        config['threshold_value'] = args.threshold
+    if args.min_area is not None:
+        config['min_area'] = args.min_area
+    if args.max_area is not None:
+        config['max_area'] = args.max_area
+    if args.max_blobs is not None:
+        config['max_blobs'] = args.max_blobs
     
     try:
         source = int(args.input)
@@ -535,6 +647,21 @@ def main():
     if export_alpha:
         os.makedirs(args.png_output, exist_ok=True)
         print(f"PNG alpha sequence will be saved to: {args.png_output}/")
+
+    # Load animated mask sequence (optional)
+    mask_frames = []
+    if args.mask_input and os.path.isdir(args.mask_input):
+        mask_files = sorted(glob.glob(os.path.join(args.mask_input, '*.png')))
+        for f in mask_files:
+            img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+            if img is not None and img.ndim == 3 and img.shape[2] == 4:
+                mask_frames.append(img[:, :, 3])
+        if mask_frames:
+            print(f"Mask loaded: {len(mask_frames)} frames from {args.mask_input}")
+        else:
+            print(f"Warning: no valid RGBA PNG found in {args.mask_input}, running without mask")
+    elif args.mask_input:
+        print(f"Warning: mask folder not found: {args.mask_input}, running without mask")
     
     print(f"Source: {cap_w}x{cap_h}  |  Preview: {INITIAL_W}x{INITIAL_H}  |  FPS: {fps}")
     print("Window resizable with mouse")
@@ -546,7 +673,7 @@ def main():
     print("Press 'g' to toggle grid")
     print("Press 'd' to toggle dotted lines")
     print("Press 'x' to toggle boxes")
-    print("Press 'p' to toggle center dot")
+    print("Press 'p' to toggle center dot (cycle: off -> dot -> cross)")
     
     frame_count = 0
     
@@ -555,7 +682,12 @@ def main():
         if not ret:
             break
         
-        output_4k, alpha_4k = tracker.process_frame(frame, config, export_alpha=export_alpha)
+        output_4k, alpha_4k = tracker.process_frame(
+            frame, config,
+            export_alpha=export_alpha,
+            mask_frames=mask_frames if mask_frames else None,
+            frame_index=frame_count
+        )
         
         if writer:
             writer.write(output_4k)
@@ -594,8 +726,17 @@ def main():
             config['show_boxes'] = not config['show_boxes']
             print(f"Boxes: {'ON' if config['show_boxes'] else 'OFF'}")
         elif key == ord('p'):
-            config['show_center_dot'] = not config['show_center_dot']
-            print(f"Center Dot: {'ON' if config['show_center_dot'] else 'OFF'}")
+            # Cycle: off -> dot -> cross -> off
+            if config['show_center_dot'] == False:
+                config['show_center_dot'] = True
+                config['center_dot_style'] = 'dot'
+                print("Center Dot: DOT")
+            elif config['center_dot_style'] == 'dot':
+                config['center_dot_style'] = 'cross'
+                print("Center Dot: CROSS")
+            else:
+                config['show_center_dot'] = False
+                print("Center Dot: OFF")
         
         frame_count += 1
     

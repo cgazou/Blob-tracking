@@ -5,8 +5,10 @@
 EXE_NAME = BlobTracker4K
 SCRIPT_MAIN = blob_tracker_menu.py
 SCRIPT_APP = blob_tracker_app.py
+ICON = logo.ico
 
-PYINSTALLER_FLAGS = --onefile --console --add-data "$(SCRIPT_APP);." --collect-all numpy --collect-all cv2 --name "$(EXE_NAME)"
+# PyInstaller flags
+PYINSTALLER_FLAGS = --onefile --console --add-data "$(SCRIPT_APP);." --collect-all numpy --collect-all cv2 --icon=$(ICON) --name "$(EXE_NAME)"
 
 all: build
 
@@ -33,3 +35,10 @@ distclean: clean
 	@echo "Removing executable..."
 	-rmdir /s /q dist 2>nul
 	@echo "Distclean done!"
+
+# Help
+help:
+	@echo "Available commands:"
+	@echo "  make build      - Build executable"
+	@echo "  make clean      - Remove build files"
+	@echo "  make distclean  - Remove build files and executable"

@@ -6,6 +6,7 @@ import sys
 import os
 import re
 from collections import deque
+import glob
 
 if getattr(sys, 'frozen', False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -236,7 +237,7 @@ class BlobTracker:
                 cv2.line(canvas, (0,int(y)), (out_w,int(y)), gc, 1, cv2.LINE_4)
                 y += config['grid_spacing']
 
-    def process_frame(self, frame, config, export_alpha=False):
+    def process_frame(self, frame, config, export_alpha=False, mask_frames=None, frame_index=0):
         out_h, out_w = frame.shape[:2]
         
         # Get scaled parameters based on resolution
@@ -262,6 +263,14 @@ class BlobTracker:
             det_w, det_h = out_w, out_h
 
         sx, sy = out_w / det_w, out_h / det_h
+
+        # Apply animated mask — masked zones are excluded from detection
+        if mask_frames:
+            mask = mask_frames[frame_index % len(mask_frames)]
+            if mask.shape[:2] != (det_h, det_w):
+                mask = cv2.resize(mask, (det_w, det_h), interpolation=cv2.INTER_NEAREST)
+            thresh_det[mask > 0] = 0
+
         area_scale = res * res
         adj_min = max(1.0, config['min_area'] * area_scale)
         adj_max = max(adj_min + 1, config['max_area'] * area_scale)
@@ -341,6 +350,8 @@ def main():
     parser.add_argument('--min-area',   type=float, default=None)
     parser.add_argument('--max-area',   type=float, default=None)
     parser.add_argument('--max-blobs',  type=int,   default=None)
+    parser.add_argument('--mask-input', type=str,   default=None,
+                        help='Folder with animated PNG mask sequence (optional)')
 
     args = parser.parse_args()
     
@@ -365,7 +376,7 @@ def main():
         'outline_color':        (255, 255, 255),
         'trail_color':          (255, 255, 255),
         'trail_thickness':      2,
-        'blob_thickness':       2,
+        'blob_thickness':       3,
         'draw_connections':     True,
         'draw_trails':          True,
         'show_ids':             True,
@@ -443,6 +454,21 @@ def main():
         os.makedirs(args.png_output, exist_ok=True)
         print(f"PNG alpha -> {args.png_output}/  ({total} frames expected)")
 
+    # Load animated mask sequence (optional)
+    mask_frames = []
+    if args.mask_input and os.path.isdir(args.mask_input):
+        mask_files = sorted(glob.glob(os.path.join(args.mask_input, '*.png')))
+        for f in mask_files:
+            img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+            if img is not None and img.ndim == 3 and img.shape[2] == 4:
+                mask_frames.append(img[:, :, 3])  # alpha channel only
+        if mask_frames:
+            print(f"Mask loaded: {len(mask_frames)} frames from {args.mask_input}")
+        else:
+            print(f"Warning: no valid RGBA PNG found in {args.mask_input}, running without mask")
+    elif args.mask_input:
+        print(f"Warning: mask folder not found: {args.mask_input}, running without mask")
+
     print(f"\nSource: {cap_w}x{cap_h}  |  Preview: {INITIAL_W}x{INITIAL_H}  |  FPS: {fps}")
     print("Window resizable with mouse")
     print("q=quit  t=trails  c=connections  b=brackets  m=metrics  g=grid  d=dotted  x=boxes  p=dot")
@@ -455,7 +481,12 @@ def main():
             break
 
         # Process frame
-        output_4k, alpha_4k = tracker.process_frame(frame, config, export_alpha=export_alpha)
+        output_4k, alpha_4k = tracker.process_frame(
+            frame, config,
+            export_alpha=export_alpha,
+            mask_frames=mask_frames if mask_frames else None,
+            frame_index=frame_count
+        )
 
         # Write MP4
         if writer:
